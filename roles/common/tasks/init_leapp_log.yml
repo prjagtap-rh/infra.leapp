@@ -5,6 +5,9 @@
 # job_name: init_leapp_log | Ansible Leapp preupgrade analysis
 # leapp_reports_dir: "{{ __leapp_reports_dir }}"
 # leapp_log_file: "{{ __leapp_log_file }}"
+#
+# Optional variables (tests redirect these to a temporary location):
+#   __leapp_facts_dir (optional, default: '/etc/ansible/facts.d')
 
 - name: init_leapp_log | Ensure ansible_facts used by role
   ansible.builtin.include_tasks: set_facts.yml
@@ -17,49 +20,14 @@
     group: root
     mode: "0755"
 
-- name: init_leapp_log | Check for existing log file
-  ansible.builtin.stat:
-    path: "{{ leapp_log_file }}"
-  register: log_file_stat
+- name: init_leapp_log | Record start time
+  ansible.builtin.set_fact:
+    leapp_start_time: "{{ now(fmt='%Y-%m-%dT%H:%M:%SZ', utc=true) }}"
 
-- name: init_leapp_log | Fail if log file already exists
-  ansible.builtin.fail:
-    msg: >-
-      Another Ansible leapp playbook job is already running. See
-      {{ leapp_log_file }} for details. If the previous job was aborted,
-      rename the log file to clear this failure and try again.
-  when: log_file_stat.stat.exists
-
-# Don't forget to archive the log file at the end of the parent role
-- name: init_leapp_log | Create new log file
-  ansible.builtin.copy:
-    content: |
-      {{ job_name }}
-      Job started at {{ now(fmt='%Y-%m-%dT%H:%M:%SZ', utc=true) }}
-    dest: "{{ leapp_log_file }}"
-    owner: root
-    group: root
-    mode: "0644"
-
-- name: init_leapp_log | /etc/ansible/facts.d directory exists
-  ansible.builtin.file:
-    path: /etc/ansible/facts.d
-    state: directory
-    mode: "0755"
-    owner: root
-    group: root
-
-- name: init_leapp_log | Capture current ansible_facts for validation after upgrade
-  ansible.builtin.copy:
-    content: "{{ ansible_facts | ansible.builtin.combine({'ansible_local': {}}) }}"
-    dest: "{{ item }}"
-    mode: "0644"
-    owner: root
-    group: root
-  loop:
-    - /etc/ansible/facts.d/pre_ipu.fact
-    - "{{ leapp_log_file }}"
-
+# Gather everything the log needs before the existence check so the slow rpm
+# query stays out of the check -> create window. This keeps the gap between the
+# mutex check and log creation as small as possible
+# TODO: introduce a proper atomic lock
 - name: init_leapp_log | Capture a list of non-rhel versioned packages
   ansible.builtin.shell:
     cmd: >-
@@ -78,15 +46,62 @@
   ansible.builtin.set_fact:
     non_rhel_packages: "{{ unsigned_packages_pre.stdout_lines }}"
 
-- name: init_leapp_log | Capture the list of non-rhel versioned packages in a separate fact file
+- name: init_leapp_log | Check for existing log file
+  ansible.builtin.stat:
+    path: "{{ leapp_log_file }}"
+  register: log_file_stat
+
+- name: init_leapp_log | Fail if log file already exists
+  ansible.builtin.fail:
+    msg: >-
+      Another Ansible leapp playbook job is already running. See
+      {{ leapp_log_file }} for details. If the previous job was aborted,
+      rename the log file to clear this failure and try again.
+  when: log_file_stat.stat.exists
+
+# Created immediately after the existence check to keep the window between the
+# check and the creation as small as possible. Don't forget to archive the log
+# file at the end of the parent role.
+- name: init_leapp_log | Create new log file with complete initialization details
   ansible.builtin.copy:
-    content: "{{ non_rhel_packages }}"
-    dest: "{{ item }}"
+    content: |
+      {{ job_name }}
+      Job started at {{ leapp_start_time }}
+
+      {{ ansible_facts | ansible.builtin.combine({'ansible_local': {}}) }}
+
+      {{ non_rhel_packages }}
+    dest: "{{ leapp_log_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: init_leapp_log | Ensure facts.d directory exists
+  ansible.builtin.file:
+    path: "{{ __leapp_facts_dir | default('/etc/ansible/facts.d') }}"
+    state: directory
+    mode: "0755"
+    owner: root
+    group: root
+
+# Store facts in facts.d so they persist across the reboot/upgrade and are
+# re-read as ansible_local facts on later runs for post-upgrade validation.
+- name: init_leapp_log | Capture current ansible_facts for validation after upgrade
+  ansible.builtin.copy:
+    content: "{{ ansible_facts | ansible.builtin.combine({'ansible_local': {}}) }}"
+    dest: "{{ __leapp_facts_dir | default('/etc/ansible/facts.d') }}/pre_ipu.fact"
     mode: "0644"
     owner: root
     group: root
-  loop:
-    - /etc/ansible/facts.d/non_rhel_packages.fact
-    - "{{ leapp_log_file }}"
+
+# Persisted to facts.d for the same reason: available as an ansible_local fact
+# after the upgrade to diff against the post-upgrade package list.
+- name: init_leapp_log | Capture the list of non-rhel versioned packages in a separate fact file
+  ansible.builtin.copy:
+    content: "{{ non_rhel_packages }}"
+    dest: "{{ __leapp_facts_dir | default('/etc/ansible/facts.d') }}/non_rhel_packages.fact"
+    mode: "0644"
+    owner: root
+    group: root
 
 ...
